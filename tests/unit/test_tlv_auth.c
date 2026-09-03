@@ -290,11 +290,43 @@ TEST(test_oversized_tlv_len_is_rejected)
     ASSERT(eos_rollback_read_image_counter(SLOT_A_ADDR, &counter) == EOS_ERR_INVALID);
 }
 
+/*
+ * Regression: the production boot and update paths used to feed
+ * hdr.image_version into eos_image_check_rollback(), which compares that
+ * number to the OTP monotonic floor. Firmware versions (0x00MMmmpp) and
+ * TLV security counters are different scales. An old image with
+ * image_version = 0x00010000 and authenticated MIN_SEC_VER = 3 therefore
+ * passed a floor of 9, defeating the anti-rollback gate.
+ *
+ * The hardware-floor decision is eos_rollback_verify(tlv_counter).
+ */
+extern int eos_image_check_rollback(uint32_t candidate_version);
+
+TEST(test_hw_floor_uses_tlv_counter_not_image_version)
+{
+    build_image(3, true, true);
+
+    eos_image_header_t hdr;
+    ASSERT(eos_image_parse_header(SLOT_A_ADDR, &hdr) == EOS_OK);
+    ASSERT(hdr.image_version == 0x00010000u);
+
+    uint32_t counter = 0;
+    ASSERT(eos_rollback_read_image_counter(SLOT_A_ADDR, &counter) == EOS_OK);
+    ASSERT(counter == 3);
+
+    sim_counter = 9;
+
+    /* The old production check: image_version against the HW floor. */
+    ASSERT(eos_image_check_rollback(hdr.image_version) == EOS_OK);
+
+    /* The authenticated counter is below the floor and must be rejected. */
+    ASSERT(eos_rollback_verify(counter) == EOS_ERR_ANTI_ROLLBACK);
+}
+
 int main(void)
 {
     printf("TLV authentication (anti-rollback counter)\n\n");
 
-    tests_run = 8;
     run_test_authenticated_tlv_counter_is_read();
     run_test_tampered_tlv_counter_is_rejected();
     run_test_tamper_is_invisible_to_signature_and_integrity();
@@ -302,8 +334,9 @@ int main(void)
     run_test_image_without_tlv_area_still_reports_zero();
     run_test_tlv_binding_fields_are_inside_the_signed_prefix();
     run_test_oversized_tlv_len_is_rejected();
+    run_test_hw_floor_uses_tlv_counter_not_image_version();
 
-    tests_run = 7;
+    tests_run = 8;
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

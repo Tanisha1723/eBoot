@@ -10,6 +10,7 @@
 #include "eos_fw_update.h"
 #include "eos_hal.h"
 #include "eos_fwsvc.h"
+#include "eos_rollback.h"
 #include <string.h>
 
 int eos_fw_update_begin(eos_fw_update_ctx_t *ctx, eos_slot_t slot)
@@ -184,10 +185,19 @@ int eos_fw_update_finalize(eos_fw_update_ctx_t *ctx, eos_upgrade_mode_t mode)
         }
     }
 
-    /* Anti-rollback check */
-    extern int eos_image_check_rollback(uint32_t candidate_version);
-    int rb_rc = eos_image_check_rollback(ctx->header.image_version);
-    if (rb_rc != EOS_OK && rb_rc != EOS_ERR_NOT_SUPPORTED) {
+    /* Persistent floor: authenticated TLV security counter, not image_version.
+     * Finalize installs the image; it does not boot it, so the counter is
+     * verified here but not staged. */
+    uint32_t img_counter = 0;
+    int rb_rc = eos_rollback_read_image_counter(ctx->target_addr, &img_counter);
+    if (rb_rc != EOS_OK) {
+        ctx->state = EOS_FW_STATE_ERROR;
+        ctx->last_error = rb_rc;
+        return rb_rc;
+    }
+
+    rb_rc = eos_rollback_verify(img_counter);
+    if (rb_rc != EOS_OK) {
         ctx->state = EOS_FW_STATE_ERROR;
         ctx->last_error = rb_rc;
         return rb_rc;
