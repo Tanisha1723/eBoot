@@ -291,16 +291,28 @@ TEST(test_oversized_tlv_len_is_rejected)
 }
 
 /*
- * Regression: the production boot and update paths used to feed
- * hdr.image_version into eos_image_check_rollback(), which compares that
- * number to the OTP monotonic floor. Firmware versions (0x00MMmmpp) and
- * TLV security counters are different scales. An old image with
+ * The production boot and update paths used to feed hdr.image_version into
+ * a hardware-floor comparison. Firmware versions (0x00MMmmpp) and TLV
+ * security counters are different scales. An old image with
  * image_version = 0x00010000 and authenticated MIN_SEC_VER = 3 therefore
- * passed a floor of 9, defeating the anti-rollback gate.
+ * passed a floor of 9.
  *
- * The hardware-floor decision is eos_rollback_verify(tlv_counter).
+ * That helper is gone from production. This is the old comparison, kept
+ * only so the regression can show why image_version must not be the floor
+ * input. The hardware-floor decision is eos_rollback_verify(tlv_counter).
  */
-extern int eos_image_check_rollback(uint32_t candidate_version);
+static int legacy_broken_version_floor_check(uint32_t candidate_version)
+{
+    uint32_t hw_min_version = 0;
+    int rc = eos_hal_monotonic_read(&hw_min_version);
+    if (rc == EOS_ERR_NOT_SUPPORTED)
+        return EOS_OK;
+    if (rc != EOS_OK)
+        return rc;
+    if (candidate_version < hw_min_version)
+        return EOS_ERR_ANTI_ROLLBACK;
+    return EOS_OK;
+}
 
 TEST(test_hw_floor_uses_tlv_counter_not_image_version)
 {
@@ -317,7 +329,7 @@ TEST(test_hw_floor_uses_tlv_counter_not_image_version)
     sim_counter = 9;
 
     /* The old production check: image_version against the HW floor. */
-    ASSERT(eos_image_check_rollback(hdr.image_version) == EOS_OK);
+    ASSERT(legacy_broken_version_floor_check(hdr.image_version) == EOS_OK);
 
     /* The authenticated counter is below the floor and must be rejected. */
     ASSERT(eos_rollback_verify(counter) == EOS_ERR_ANTI_ROLLBACK);
