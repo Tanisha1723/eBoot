@@ -8,13 +8,15 @@
  *
  * The anti-rollback regression drives eos_fw_update_finalize() so the
  * production wiring in core/fw_update.c is what reads the authenticated
- * TLV counter and compares it to the hardware floor.
+ * TLV counter and compares it to the hardware floor. The TLV tail is
+ * delivered through eos_fw_update_write(), not poked into flash.
  */
 
 #include "eos_fw_update.h"
 #include "eos_image.h"
 #include "eos_image_tlv.h"
 #include "eos_crypto_boot.h"
+#include "eos_bootctl.h"
 #include "eos_hal.h"
 #include <stdio.h>
 #include <string.h>
@@ -70,6 +72,9 @@ static const eos_board_ops_t sim_ops = {
     .slot_a_size         = SIM_SLOT_A_SIZE,
     .slot_b_addr         = SIM_SLOT_B_ADDR,
     .slot_b_size         = SIM_SLOT_B_SIZE,
+    .bootctl_addr        = 0x0E000u,
+    .bootctl_backup_addr = 0x0E200u,
+    .log_addr            = 0x0E400u,
     .flash_read          = sim_flash_read,
     .flash_write         = sim_flash_write,
     .flash_erase         = sim_flash_erase,
@@ -106,13 +111,18 @@ static int tests_passed = 0;
 #define STREAMED_LEN   (sizeof(eos_image_header_t) + PAYLOAD_SIZE)
 #define IMAGE_BUF_LEN  (STREAMED_LEN + TLV_AREA_LEN)
 
+static void fill_payload(uint8_t *payload)
+{
+    uint32_t i;
+    for (i = 0; i < PAYLOAD_SIZE; i++)
+        payload[i] = (uint8_t)(i * 7u + 1u);
+}
+
 static void build_image(uint8_t *out, uint32_t sec_ver)
 {
     uint8_t payload[PAYLOAD_SIZE];
-    uint32_t i;
 
-    for (i = 0; i < PAYLOAD_SIZE; i++)
-        payload[i] = (uint8_t)(i * 7u + 1u);
+    fill_payload(payload);
 
     eos_image_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -146,22 +156,14 @@ static void build_image(uint8_t *out, uint32_t sec_ver)
     memcpy(out + STREAMED_LEN, tlv, TLV_AREA_LEN);
 }
 
-/*
- * eos_fw_update_write() streams header + image_size payload only. The
- * authenticated TLV sits after that; finalize reads it from flash at
- * target_addr + hdr_size + image_size. Place those bytes so the production
- * read sees MIN_SEC_VER rather than erased 0xFF.
- */
-static void place_tlv_after_payload(const eos_fw_update_ctx_t *ctx,
-                                    const uint8_t *image)
+static void persist_bootctl(void)
 {
-    uint32_t tlv_addr = ctx->target_addr + (uint32_t)sizeof(eos_image_header_t)
-                        + PAYLOAD_SIZE;
-    ASSERT(eos_hal_flash_write(tlv_addr, image + STREAMED_LEN, TLV_AREA_LEN)
-           == EOS_OK);
+    eos_bootctl_t bctl;
+    eos_bootctl_init_defaults(&bctl);
+    ASSERT(eos_bootctl_save(&bctl) == EOS_OK);
 }
 
-TEST(test_finalize_rejects_tlv_counter_below_hw_floor)
+TEST(test_write_streams_tlv_then_finalize_rejects_below_floor)
 {
     uint8_t image[IMAGE_BUF_LEN];
     eos_image_header_t hdr;
@@ -173,22 +175,67 @@ TEST(test_finalize_rejects_tlv_counter_below_hw_floor)
     ASSERT(hdr.tlv_len == TLV_AREA_LEN);
 
     ASSERT(eos_fw_update_begin(&ctx, EOS_SLOT_B) == EOS_OK);
-    ASSERT(eos_fw_update_write(&ctx, image, STREAMED_LEN) == EOS_OK);
+    ASSERT(eos_fw_update_write(&ctx, image, IMAGE_BUF_LEN) == EOS_OK);
     ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_VERIFY);
-    place_tlv_after_payload(&ctx, image);
+    ASSERT(ctx.tlv_written == TLV_AREA_LEN);
 
     sim_counter = 9;
 
     ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_ERR_ANTI_ROLLBACK);
 }
 
+TEST(test_write_does_not_reach_verify_until_tlv_arrives)
+{
+    uint8_t image[IMAGE_BUF_LEN];
+    eos_fw_update_ctx_t ctx;
+
+    build_image(image, 3);
+
+    ASSERT(eos_fw_update_begin(&ctx, EOS_SLOT_B) == EOS_OK);
+    ASSERT(eos_fw_update_write(&ctx, image, STREAMED_LEN) == EOS_OK);
+    ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_TLV);
+    ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_ERR_INVALID);
+}
+
+TEST(test_write_rejects_bytes_past_the_image_container)
+{
+    uint8_t image[IMAGE_BUF_LEN + 1];
+    eos_fw_update_ctx_t ctx;
+
+    build_image(image, 3);
+    image[IMAGE_BUF_LEN] = 0xA5;
+
+    ASSERT(eos_fw_update_begin(&ctx, EOS_SLOT_B) == EOS_OK);
+    ASSERT(eos_fw_update_write(&ctx, image, IMAGE_BUF_LEN + 1) == EOS_ERR_INVALID);
+}
+
+TEST(test_finalize_accepts_tlv_counter_equal_to_floor)
+{
+    uint8_t image[IMAGE_BUF_LEN];
+    eos_fw_update_ctx_t ctx;
+
+    persist_bootctl();
+    build_image(image, 9);
+
+    ASSERT(eos_fw_update_begin(&ctx, EOS_SLOT_B) == EOS_OK);
+    ASSERT(eos_fw_update_write(&ctx, image, IMAGE_BUF_LEN) == EOS_OK);
+    ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_VERIFY);
+
+    sim_counter = 9;
+
+    ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_OK);
+}
+
 int main(void)
 {
     printf("Firmware update (finalize anti-rollback)\n\n");
 
-    run_test_finalize_rejects_tlv_counter_below_hw_floor();
+    run_test_write_streams_tlv_then_finalize_rejects_below_floor();
+    run_test_write_does_not_reach_verify_until_tlv_arrives();
+    run_test_write_rejects_bytes_past_the_image_container();
+    run_test_finalize_accepts_tlv_counter_equal_to_floor();
 
-    tests_run = 1;
+    tests_run = 4;
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

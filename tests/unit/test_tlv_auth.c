@@ -290,6 +290,18 @@ TEST(test_oversized_tlv_len_is_rejected)
     ASSERT(eos_rollback_read_image_counter(SLOT_A_ADDR, &counter) == EOS_ERR_INVALID);
 }
 
+TEST(test_tlv_area_must_fit_in_slot)
+{
+    build_image(3, true, true);
+
+    eos_board_ops_t tiny = sim_ops;
+    tiny.slot_a_size = (uint32_t)(sizeof(eos_image_header_t) + PAYLOAD_SIZE + 4u);
+    eos_hal_init(&tiny);
+
+    uint32_t counter = 0;
+    ASSERT(eos_rollback_read_image_counter(SLOT_A_ADDR, &counter) == EOS_ERR_INVALID);
+}
+
 /*
  * The production boot and update paths used to feed hdr.image_version into
  * a hardware-floor comparison. Firmware versions (0x00MMmmpp) and TLV
@@ -346,9 +358,10 @@ int main(void)
     run_test_image_without_tlv_area_still_reports_zero();
     run_test_tlv_binding_fields_are_inside_the_signed_prefix();
     run_test_oversized_tlv_len_is_rejected();
+    run_test_tlv_area_must_fit_in_slot();
     run_test_hw_floor_uses_tlv_counter_not_image_version();
 
-    tests_run = 8;
+    tests_run = 9;
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

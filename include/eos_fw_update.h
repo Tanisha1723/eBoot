@@ -36,9 +36,10 @@ typedef enum {
     EOS_FW_STATE_IDLE       = 0,
     EOS_FW_STATE_HEADER     = 1,
     EOS_FW_STATE_PAYLOAD    = 2,
-    EOS_FW_STATE_VERIFY     = 3,
-    EOS_FW_STATE_COMPLETE   = 4,
-    EOS_FW_STATE_ERROR      = 5,
+    EOS_FW_STATE_TLV        = 3,
+    EOS_FW_STATE_VERIFY     = 4,
+    EOS_FW_STATE_COMPLETE   = 5,
+    EOS_FW_STATE_ERROR      = 6,
 } eos_fw_update_state_t;
 
 typedef struct {
@@ -56,6 +57,8 @@ typedef struct {
     /* Streaming write state */
     uint32_t payload_written;
     uint32_t payload_total;
+    uint32_t tlv_written;
+    uint32_t tlv_total;
     uint32_t write_addr;
 
     /* Integrity tracking */
@@ -79,8 +82,10 @@ typedef struct {
 int eos_fw_update_begin(eos_fw_update_ctx_t *ctx, eos_slot_t slot);
 
 /**
- * Write a chunk of firmware data. Handles header parsing and
- * payload streaming automatically.
+ * Write a chunk of firmware data. Handles header parsing, payload
+ * streaming, and the authenticated TLV tail (hdr.tlv_len bytes after
+ * the payload). Extra bytes beyond that container are rejected;
+ * they are not discarded with EOS_OK.
  *
  * @param ctx   Update context.
  * @param data  Chunk of firmware data.
