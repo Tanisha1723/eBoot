@@ -95,6 +95,24 @@ int eos_fw_update_begin(eos_fw_update_ctx_t *ctx, eos_slot_t slot);
 int eos_fw_update_write(eos_fw_update_ctx_t *ctx, const uint8_t *data, size_t len);
 
 /**
+ * Number of container bytes eos_fw_update_write() will still accept.
+ *
+ * A block-framed transport such as XMODEM has no container length of its
+ * own and pads its final block; this is how it tells image bytes from
+ * padding instead of pushing the padding into eos_fw_update_write(), which
+ * rejects anything past the container.
+ *
+ * While the header is still arriving only the header remainder is known,
+ * because image_size and tlv_len are fields inside it. Call this again
+ * after each write rather than once per block.
+ *
+ * @param ctx   Update context.
+ * @return Bytes still wanted, or 0 once the container is complete or the
+ *         context is idle or failed.
+ */
+uint32_t eos_fw_update_bytes_wanted(const eos_fw_update_ctx_t *ctx);
+
+/**
  * Finalize the update: verify integrity, update boot control,
  * and optionally mark for test boot.
  *

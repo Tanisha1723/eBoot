@@ -209,6 +209,66 @@ TEST(test_write_rejects_bytes_past_the_image_container)
     ASSERT(eos_fw_update_write(&ctx, image, IMAGE_BUF_LEN + 1) == EOS_ERR_INVALID);
 }
 
+/*
+ * A block-framed transport asks how much of the container is still
+ * outstanding so it can stop before its own padding. The header remainder
+ * is all that is knowable until the header parses, because image_size and
+ * tlv_len are fields inside it.
+ */
+TEST(test_bytes_wanted_tracks_the_remaining_container)
+{
+    uint8_t image[IMAGE_BUF_LEN];
+    eos_fw_update_ctx_t ctx;
+
+    build_image(image, 3);
+
+    ASSERT(eos_fw_update_begin(&ctx, EOS_SLOT_B) == EOS_OK);
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) == sizeof(eos_image_header_t));
+
+    ASSERT(eos_fw_update_write(&ctx, image, sizeof(eos_image_header_t)) == EOS_OK);
+    ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_PAYLOAD);
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) == PAYLOAD_SIZE + TLV_AREA_LEN);
+
+    ASSERT(eos_fw_update_write(&ctx, image + sizeof(eos_image_header_t),
+                               PAYLOAD_SIZE) == EOS_OK);
+    ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_TLV);
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) == TLV_AREA_LEN);
+
+    ASSERT(eos_fw_update_write(&ctx, image + STREAMED_LEN, TLV_AREA_LEN) == EOS_OK);
+    ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_VERIFY);
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) == 0);
+}
+
+/*
+ * The trailing byte used to be treated differently depending on where the
+ * chunk boundary fell: sharing a call with the last container byte drove the
+ * context to ERROR, while arriving in its own call did not. Both are the
+ * same protocol mistake and both must report it without discarding a
+ * container that was already received in full.
+ */
+TEST(test_trailing_byte_is_rejected_the_same_across_chunk_boundaries)
+{
+    uint8_t image[IMAGE_BUF_LEN + 1];
+    eos_fw_update_ctx_t single, split;
+    int rc_single, rc_split;
+
+    build_image(image, 3);
+    image[IMAGE_BUF_LEN] = 0xA5;
+
+    ASSERT(eos_fw_update_begin(&single, EOS_SLOT_B) == EOS_OK);
+    rc_single = eos_fw_update_write(&single, image, IMAGE_BUF_LEN + 1);
+
+    ASSERT(eos_fw_update_begin(&split, EOS_SLOT_B) == EOS_OK);
+    ASSERT(eos_fw_update_write(&split, image, IMAGE_BUF_LEN) == EOS_OK);
+    rc_split = eos_fw_update_write(&split, &image[IMAGE_BUF_LEN], 1);
+
+    ASSERT(rc_single == EOS_ERR_INVALID);
+    ASSERT(rc_split == rc_single);
+    ASSERT(eos_fw_update_get_state(&single) == EOS_FW_STATE_VERIFY);
+    ASSERT(eos_fw_update_get_state(&split) == eos_fw_update_get_state(&single));
+    ASSERT(single.tlv_written == split.tlv_written);
+}
+
 TEST(test_finalize_accepts_tlv_counter_equal_to_floor)
 {
     uint8_t image[IMAGE_BUF_LEN];
@@ -233,9 +293,11 @@ int main(void)
     run_test_write_streams_tlv_then_finalize_rejects_below_floor();
     run_test_write_does_not_reach_verify_until_tlv_arrives();
     run_test_write_rejects_bytes_past_the_image_container();
+    run_test_bytes_wanted_tracks_the_remaining_container();
+    run_test_trailing_byte_is_rejected_the_same_across_chunk_boundaries();
     run_test_finalize_accepts_tlv_counter_equal_to_floor();
 
-    tests_run = 4;
+    tests_run = 6;
     printf("\n%d/%d passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }

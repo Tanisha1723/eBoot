@@ -185,12 +185,13 @@ int eos_fw_update_write(eos_fw_update_ctx_t *ctx, const uint8_t *data, size_t le
             ctx->state = EOS_FW_STATE_VERIFY;
     }
 
-    /* Bytes past the image container must not be discarded as success. */
-    if (offset < len) {
-        ctx->state = EOS_FW_STATE_ERROR;
-        ctx->last_error = EOS_ERR_INVALID;
+    /* Bytes past the image container must not be discarded as success.
+     * The container is complete here, so this reports the error without
+     * downgrading a finished context: trailing bytes behave the same
+     * whether they share this call with the last container byte or
+     * arrive in the next one. */
+    if (offset < len)
         return EOS_ERR_INVALID;
-    }
 
     ctx->total_received += (uint32_t)len;
     return EOS_OK;
@@ -297,6 +298,29 @@ uint8_t eos_fw_update_progress(const eos_fw_update_ctx_t *ctx)
     if (done > total) done = total;
 
     return (uint8_t)(((uint64_t)done * 100) / total);
+}
+
+uint32_t eos_fw_update_bytes_wanted(const eos_fw_update_ctx_t *ctx)
+{
+    if (!ctx) return 0;
+
+    switch (ctx->state) {
+    case EOS_FW_STATE_HEADER:
+        /* image_size and tlv_len live in the header, so the payload and
+         * TLV remainders are unknown until it has been parsed. Callers
+         * ask again after each write. */
+        return (uint32_t)sizeof(eos_image_header_t) - ctx->hdr_received;
+
+    case EOS_FW_STATE_PAYLOAD:
+        return (ctx->payload_total - ctx->payload_written) +
+               (ctx->tlv_total - ctx->tlv_written);
+
+    case EOS_FW_STATE_TLV:
+        return ctx->tlv_total - ctx->tlv_written;
+
+    default:
+        return 0;
+    }
 }
 
 eos_fw_update_state_t eos_fw_update_get_state(const eos_fw_update_ctx_t *ctx)
