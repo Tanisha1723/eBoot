@@ -14,6 +14,7 @@
 #include "eos_fw_transport.h"
 #include "eos_fw_update.h"
 #include "eos_image.h"
+#include "eos_image_tlv.h"
 #include "eos_hal.h"
 #include <stdio.h>
 #include <string.h>
@@ -176,6 +177,7 @@ static int tests_passed = 0;
 #define XM_EOT  0x04
 #define XM_ACK  0x06
 #define XM_NAK  0x15
+#define XM_CAN  0x18
 #define BLOCK   128
 #define BLOCK_L 1024
 
@@ -289,7 +291,96 @@ static void push_image_block(int index)
     push_block((uint8_t)(index + 1), &image_buf[(size_t)index * BLOCK], BLOCK);
 }
 
-static int run_ymodem(void)
+/* ---- Update container carrying an authenticated TLV area ----
+ *
+ * 156-byte header + 256-byte payload + 12-byte TLV area = 424 bytes, which is
+ * three full 128-byte blocks plus 40. The final block therefore carries the
+ * end of the payload, the payload-to-TLV transition, the whole TLV area and
+ * 88 bytes of block padding -- every boundary the receiver has to get right.
+ */
+
+#define CONT_PAYLOAD_LEN  256u
+#define CONT_TLV_LEN      (uint16_t)(sizeof(eos_tlv_info_t) + \
+                                     sizeof(eos_tlv_entry_hdr_t) + \
+                                     sizeof(uint32_t))
+#define CONT_LEN          (sizeof(eos_image_header_t) + CONT_PAYLOAD_LEN + \
+                           CONT_TLV_LEN)
+#define CONT_BLOCKS       4
+
+static uint8_t container[CONT_LEN];
+
+/* Mirrors update_crc() in core/fw_update.c so finalize sees a matching CRC32
+ * on the flags = 0 integrity path. */
+static uint32_t crc32_payload(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            if (crc & 1) crc = (crc >> 1) ^ 0xEDB88320u;
+            else         crc >>= 1;
+        }
+    }
+    return ~crc;
+}
+
+static void build_container(void)
+{
+    eos_image_header_t hdr;
+    uint8_t *payload = &container[sizeof(hdr)];
+    uint8_t *tlv = &container[sizeof(hdr) + CONT_PAYLOAD_LEN];
+    uint8_t digest[EOS_SHA256_DIGEST_SIZE];
+    uint32_t sec_ver = 5;
+    size_t i;
+
+    memset(container, 0, sizeof(container));
+    for (i = 0; i < CONT_PAYLOAD_LEN; i++)
+        payload[i] = (uint8_t)(0x5A + (i & 0x1F));
+
+    /* [tlv_info][entry_hdr][uint32 counter], the shape the update and
+     * rollback suites build. */
+    eos_tlv_info_t info = { EOS_TLV_INFO_MAGIC, CONT_TLV_LEN };
+    eos_tlv_entry_hdr_t ent = { EOS_TLV_MIN_SEC_VER, sizeof(uint32_t) };
+    memcpy(tlv, &info, sizeof(info));
+    memcpy(tlv + sizeof(info), &ent, sizeof(ent));
+    memcpy(tlv + sizeof(info) + sizeof(ent), &sec_ver, sizeof(sec_ver));
+
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic       = EOS_IMG_MAGIC;
+    hdr.hdr_version = EOS_IMAGE_HDR_VERSION;
+    hdr.hdr_size    = (uint16_t)sizeof(hdr);
+    hdr.image_size  = (uint32_t)CONT_PAYLOAD_LEN;
+    hdr.load_addr   = SIM_SLOT_B_ADDR;
+    hdr.entry_addr  = SIM_SLOT_B_ADDR;
+    hdr.flags       = 0;              /* CRC32 integrity path */
+    hdr.sig_type    = EOS_SIG_NONE;
+
+    uint32_t crc = crc32_payload(payload, CONT_PAYLOAD_LEN);
+    memcpy(hdr.hash, &crc, sizeof(crc));
+
+    /* The TLV area is authenticated by the header hash, so rollback will
+     * accept the counter it carries. */
+    eos_sha256(tlv, CONT_TLV_LEN, digest);
+    hdr.tlv_len = CONT_TLV_LEN;
+    memcpy(hdr.tlv_hash, digest, EOS_IMG_TLV_HASH_LEN);
+
+    memcpy(container, &hdr, sizeof(hdr));
+}
+
+/* The container as CONT_BLOCKS fixed 128-byte blocks, the last one padded. */
+static void push_container_blocks(void)
+{
+    int i;
+
+    for (i = 0; i < CONT_BLOCKS; i++) {
+        size_t off = (size_t)i * BLOCK;
+        size_t n = CONT_LEN - off;
+        if (n > BLOCK) n = BLOCK;
+        push_block((uint8_t)(i + 1), &container[off], n);
+    }
+}
+
+static int run_ymodem_ctx(eos_fw_update_ctx_t *ctx)
 {
     const eos_fw_transport_ops_t *ops = eos_fw_transport_uart_ymodem();
     eos_fw_transport_t tp;
@@ -298,9 +389,14 @@ static int run_ymodem(void)
     tp.baudrate = 115200;
     tp.timeout_ms = 10;
 
+    ASSERT(eos_fw_update_begin(ctx, EOS_SLOT_B) == EOS_OK);
+    return ops->receive(&tp, ctx);
+}
+
+static int run_ymodem(void)
+{
     eos_fw_update_ctx_t ctx;
-    ASSERT(eos_fw_update_begin(&ctx, EOS_SLOT_B) == EOS_OK);
-    return ops->receive(&tp, &ctx);
+    return run_ymodem_ctx(&ctx);
 }
 
 static int flash_matches_image(void)
@@ -484,65 +580,35 @@ TEST(test_ymodem_first_block_must_be_zero)
     ASSERT(tx_contains(XM_NAK));
 }
 
+/*
+ * The declared file size is YMODEM framing, and a sender is free to round it
+ * up to its own file or block padding. The container is what the image itself
+ * declares, and that is the authority on how many bytes are image, so the
+ * surplus must be dropped rather than pushed into eos_fw_update_write().
+ * Dropping it is correct framing, not a protocol error, so no CAN is sent.
+ */
+TEST(test_ymodem_declared_size_larger_than_container_is_clamped)
+{
+    eos_fw_update_ctx_t ctx;
+
+    build_container();
+    push_header_block("fw.bin", "512");   /* 424 bytes of image, padded to 512 */
+    push_container_blocks();
+    rx_push_byte(XM_EOT);
+    rx_push_byte(XM_EOT);
+
+    ASSERT(run_ymodem_ctx(&ctx) == EOS_OK);
+    ASSERT(memcmp(&sim_flash[SIM_SLOT_B_ADDR], container, CONT_LEN) == 0);
+    ASSERT(sim_flash[SIM_SLOT_B_ADDR + CONT_LEN] == 0xFF);
+    ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_VERIFY);
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) == 0);
+    ASSERT(ctx.tlv_written == CONT_TLV_LEN);
+    ASSERT(!tx_contains(XM_CAN));
+}
+
 /* ================================================================
  * XMODEM
  * ================================================================ */
-
-/*
- * XMODEM has no length field and always sends whole 128-byte blocks, so a
- * container whose length is not a multiple of 128 arrives with padding on
- * the final block. eos_fw_update_write() rejects bytes past the container
- * instead of discarding them, so the receiver has to stop at the container
- * boundary itself.
- *
- * 424 bytes is 3 full blocks plus 40, so block 4 carries 88 padding bytes.
- */
-#define XM_CONTAINER_LEN  424u
-#define XM_PAYLOAD_LEN    (XM_CONTAINER_LEN - sizeof(eos_image_header_t))
-#define XM_BLOCKS         4
-
-static uint8_t xm_image[XM_CONTAINER_LEN];
-
-/* Mirrors update_crc() in core/fw_update.c so finalize sees a matching
- * CRC32 on the flags = 0 integrity path. */
-static uint32_t crc32_payload(const uint8_t *data, size_t len)
-{
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int bit = 0; bit < 8; bit++) {
-            if (crc & 1) crc = (crc >> 1) ^ 0xEDB88320u;
-            else         crc >>= 1;
-        }
-    }
-    return ~crc;
-}
-
-static void build_unaligned_image(void)
-{
-    eos_image_header_t hdr;
-    uint8_t *payload = &xm_image[sizeof(hdr)];
-    size_t i;
-
-    memset(xm_image, 0, sizeof(xm_image));
-    for (i = 0; i < XM_PAYLOAD_LEN; i++)
-        payload[i] = (uint8_t)(0x5A + (i & 0x1F));
-
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic       = EOS_IMG_MAGIC;
-    hdr.hdr_version = EOS_IMAGE_HDR_VERSION;
-    hdr.hdr_size    = (uint16_t)sizeof(hdr);
-    hdr.image_size  = (uint32_t)XM_PAYLOAD_LEN;
-    hdr.load_addr   = SIM_SLOT_B_ADDR;
-    hdr.entry_addr  = SIM_SLOT_B_ADDR;
-    hdr.flags       = 0;              /* CRC32 integrity path */
-    hdr.sig_type    = EOS_SIG_NONE;
-    hdr.tlv_len     = 0;
-
-    uint32_t crc = crc32_payload(payload, XM_PAYLOAD_LEN);
-    memcpy(hdr.hash, &crc, sizeof(crc));
-    memcpy(xm_image, &hdr, sizeof(hdr));
-}
 
 static int run_xmodem(eos_fw_update_ctx_t *ctx)
 {
@@ -560,29 +626,60 @@ static int run_xmodem(eos_fw_update_ctx_t *ctx)
 /*
  * Regression: the strict post-container check rejected the padding on the
  * last block, so any image that did not happen to be a multiple of 128
- * failed to install over XMODEM.
+ * failed to install over XMODEM. The final block also carries the
+ * payload-to-TLV transition and the whole TLV area.
  */
 TEST(test_xmodem_padded_final_block_completes_and_finalizes)
 {
     eos_fw_update_ctx_t ctx;
-    int i;
 
-    build_unaligned_image();
-    ASSERT(XM_CONTAINER_LEN % BLOCK != 0);
+    build_container();
+    ASSERT(CONT_LEN == 424);
+    ASSERT(CONT_LEN % BLOCK != 0);
+    ASSERT(CONT_BLOCKS * BLOCK - CONT_LEN == 88);
 
-    for (i = 0; i < XM_BLOCKS; i++) {
-        size_t off = (size_t)i * BLOCK;
-        size_t n = XM_CONTAINER_LEN - off;
-        if (n > BLOCK) n = BLOCK;
-        push_block((uint8_t)(i + 1), &xm_image[off], n);
-    }
+    push_container_blocks();
     rx_push_byte(XM_EOT);
 
     ASSERT(run_xmodem(&ctx) == EOS_OK);
-    ASSERT(memcmp(&sim_flash[SIM_SLOT_B_ADDR], xm_image, XM_CONTAINER_LEN) == 0);
+    ASSERT(memcmp(&sim_flash[SIM_SLOT_B_ADDR], container, CONT_LEN) == 0);
     ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_VERIFY);
     ASSERT(eos_fw_update_bytes_wanted(&ctx) == 0);
+    ASSERT(ctx.tlv_written == CONT_TLV_LEN);
     ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_OK);
+}
+
+/*
+ * Padding in the remainder of the final block is framing the protocol
+ * guarantees. An entire further data block after the container is complete is
+ * not: XMODEM carries no length, so accepting those blocks would accept an
+ * unbounded amount of data nothing accounts for.
+ */
+TEST(test_xmodem_data_block_after_container_is_rejected)
+{
+    eos_fw_update_ctx_t ctx;
+    uint8_t extra[BLOCK];
+
+    build_container();
+    push_container_blocks();
+
+    memset(extra, 0x5C, sizeof(extra));
+    push_block((uint8_t)(CONT_BLOCKS + 1), extra, sizeof(extra));
+    rx_push_byte(XM_EOT);
+
+    ASSERT(run_xmodem(&ctx) == EOS_ERR_INVALID);
+    ASSERT(tx_contains(XM_CAN));
+
+    /* The container that did arrive is intact, and the extra block reached
+     * neither flash nor the update context. */
+    ASSERT(memcmp(&sim_flash[SIM_SLOT_B_ADDR], container, CONT_LEN) == 0);
+    ASSERT(sim_flash[SIM_SLOT_B_ADDR + CONT_LEN] == 0xFF);
+
+    /* eos_fw_transport_update() aborts the context when receive fails, so a
+     * rejected transfer cannot then be finalized as a good image. */
+    eos_fw_update_abort(&ctx);
+    ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_IDLE);
+    ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_ERR_INVALID);
 }
 
 /* ================================================================
@@ -661,12 +758,14 @@ int main(void)
     run_test_ymodem_stx_duplicate_block_is_not_written_twice();
     run_test_ymodem_header_size_overflow_is_rejected();
     run_test_ymodem_first_block_must_be_zero();
+    run_test_ymodem_declared_size_larger_than_container_is_clamped();
     run_test_xmodem_padded_final_block_completes_and_finalizes();
+    run_test_xmodem_data_block_after_container_is_rejected();
     run_test_raw_valid_transfer_is_written();
     run_test_raw_oversized_length_is_rejected();
     run_test_raw_zero_length_is_rejected();
 
-    tests_run = 13;
+    tests_run = 15;
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
 }

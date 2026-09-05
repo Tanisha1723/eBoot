@@ -189,11 +189,17 @@ int eos_fw_update_write(eos_fw_update_ctx_t *ctx, const uint8_t *data, size_t le
      * The container is complete here, so this reports the error without
      * downgrading a finished context: trailing bytes behave the same
      * whether they share this call with the last container byte or
-     * arrive in the next one. */
+     * arrive in the next one.
+     *
+     * Only the bytes actually taken from the container are counted, for
+     * the same reason: offset equals len whenever the whole input was
+     * accepted, so the running total no longer depends on the boundary
+     * either, and rejected trailing bytes are never counted. */
+    ctx->total_received += (uint32_t)offset;
+
     if (offset < len)
         return EOS_ERR_INVALID;
 
-    ctx->total_received += (uint32_t)len;
     return EOS_OK;
 }
 

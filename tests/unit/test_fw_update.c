@@ -244,7 +244,8 @@ TEST(test_bytes_wanted_tracks_the_remaining_container)
  * chunk boundary fell: sharing a call with the last container byte drove the
  * context to ERROR, while arriving in its own call did not. Both are the
  * same protocol mistake and both must report it without discarding a
- * container that was already received in full.
+ * container that was already received in full, and both must account for
+ * exactly the container bytes they consumed.
  */
 TEST(test_trailing_byte_is_rejected_the_same_across_chunk_boundaries)
 {
@@ -267,6 +268,12 @@ TEST(test_trailing_byte_is_rejected_the_same_across_chunk_boundaries)
     ASSERT(eos_fw_update_get_state(&single) == EOS_FW_STATE_VERIFY);
     ASSERT(eos_fw_update_get_state(&split) == eos_fw_update_get_state(&single));
     ASSERT(single.tlv_written == split.tlv_written);
+
+    /* The rejected byte is counted by neither, so both totals are the
+     * container length and the reported progress agrees. */
+    ASSERT(single.total_received == IMAGE_BUF_LEN);
+    ASSERT(single.total_received == split.total_received);
+    ASSERT(eos_fw_update_progress(&single) == eos_fw_update_progress(&split));
 }
 
 TEST(test_finalize_accepts_tlv_counter_equal_to_floor)

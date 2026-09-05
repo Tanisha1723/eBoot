@@ -185,6 +185,42 @@ static uint16_t xmodem_crc16(const uint8_t *data, size_t len)
     return crc;
 }
 
+/**
+ * Forward up to @p len bytes of a received block to the update context,
+ * stopping at the end of the update container.
+ *
+ * Both block-framed protocols pad their final block, and
+ * eos_fw_update_write() rejects bytes past the container rather than
+ * discarding them, so the padding has to be dropped here instead.
+ * bytes_wanted() is re-read on every pass because the payload and TLV
+ * lengths only become known once the header has been parsed.
+ *
+ * @param ctx   Update context.
+ * @param data  Block data.
+ * @param len   Bytes of @p data that belong to the transfer.
+ * @return EOS_OK, or the eos_fw_update_write() error.
+ */
+static int write_container_bytes(eos_fw_update_ctx_t *ctx,
+                                 const uint8_t *data, size_t len)
+{
+    size_t written = 0;
+
+    while (written < len) {
+        uint32_t wanted = eos_fw_update_bytes_wanted(ctx);
+        if (wanted == 0) break;
+
+        size_t chunk = len - written;
+        if (chunk > wanted) chunk = (size_t)wanted;
+
+        int rc = eos_fw_update_write(ctx, data + written, chunk);
+        if (rc != EOS_OK) return rc;
+
+        written += chunk;
+    }
+
+    return EOS_OK;
+}
+
 static int xmodem_receive(eos_fw_transport_t *tp, eos_fw_update_ctx_t *ctx)
 {
     uint32_t timeout = tp->timeout_ms ? tp->timeout_ms : 60000;
@@ -236,27 +272,24 @@ static int xmodem_receive(eos_fw_transport_t *tp, eos_fw_update_ctx_t *ctx)
             continue;
         }
 
-        /* XMODEM carries no container length and always sends whole
-         * 128-byte blocks, so the tail of the final block is padding the
-         * sender invented. Forward only what the container still wants:
-         * the rest is not image data, and eos_fw_update_write() rejects
-         * bytes past the container rather than discarding them. */
-        size_t written = 0;
-        while (written < XMODEM_BLOCK_SIZE) {
-            uint32_t wanted = eos_fw_update_bytes_wanted(ctx);
-            if (wanted == 0) break;
+        /* The container was already complete before this block arrived, so
+         * these bytes are not padding on the final block -- they are an
+         * entire extra block. XMODEM has no length field, so accepting them
+         * would accept an unbounded amount of unaccounted data. Padding
+         * inside the final block is still consumed, just below. */
+        if (eos_fw_update_bytes_wanted(ctx) == 0) {
+            c = XMODEM_CAN;
+            eos_hal_uart_send(&c, 1);
+            return EOS_ERR_INVALID;
+        }
 
-            size_t chunk = XMODEM_BLOCK_SIZE - written;
-            if (chunk > wanted) chunk = (size_t)wanted;
-
-            rc = eos_fw_update_write(ctx, block + written, chunk);
-            if (rc != EOS_OK) {
-                c = XMODEM_CAN;
-                eos_hal_uart_send(&c, 1);
-                return rc;
-            }
-
-            written += chunk;
+        /* XMODEM always sends whole 128-byte blocks, so the tail of the
+         * final block is padding the sender invented. */
+        rc = write_container_bytes(ctx, block, XMODEM_BLOCK_SIZE);
+        if (rc != EOS_OK) {
+            c = XMODEM_CAN;
+            eos_hal_uart_send(&c, 1);
+            return rc;
         }
 
         c = XMODEM_ACK;
@@ -434,20 +467,36 @@ static int ymodem_receive(eos_fw_transport_t *tp, eos_fw_update_ctx_t *ctx)
             continue;
         }
 
-        /* Write data block */
-        size_t write_len = block_size;
-        if (file_size > 0 && total_received + write_len > file_size) {
-            write_len = file_size - total_received;
+        /* Bytes of the declared file carried by this block. file_size stays
+         * the YMODEM framing bound and still marks end of file. */
+        size_t file_len = block_size;
+        if (file_size > 0 && total_received + file_len > file_size) {
+            file_len = file_size - total_received;
         }
 
-        rc = eos_fw_update_write(ctx, block, write_len);
+        /* The declared file has already been received in full, so this block
+         * falls outside the transfer entirely. eos_fw_update_write() reported
+         * that as an error when it was handed the resulting empty chunk; it
+         * stays an error now that the chunk is not handed over at all. */
+        if (file_len == 0) {
+            c = XMODEM_CAN;
+            eos_hal_uart_send(&c, 1);
+            return EOS_ERR_INVALID;
+        }
+
+        /* file_size is what the sender claims. The container is what the
+         * image itself declares, and that is the authority on how many of
+         * these bytes are image: a declared size rounded up to cover file or
+         * block padding must not push the padding into
+         * eos_fw_update_write(), which rejects bytes past the container. */
+        rc = write_container_bytes(ctx, block, file_len);
         if (rc != EOS_OK) {
             c = XMODEM_CAN;
             eos_hal_uart_send(&c, 1);
             return rc;
         }
 
-        total_received += (uint32_t)write_len;
+        total_received += (uint32_t)file_len;
         c = XMODEM_ACK;
         eos_hal_uart_send(&c, 1);
         expected_blk++;
