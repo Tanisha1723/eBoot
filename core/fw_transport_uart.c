@@ -120,6 +120,15 @@ static int uart_raw_receive(eos_fw_transport_t *tp, eos_fw_update_ctx_t *ctx)
         eos_hal_watchdog_feed();
     }
 
+    /* The length prefix is the sender's framing; the container decides
+     * whether what arrived is a whole image. A transfer that ends inside
+     * the container must not be acknowledged as one. */
+    if (eos_fw_update_bytes_wanted(ctx) != 0) {
+        uint8_t nak = UART_RAW_NAK;
+        eos_hal_uart_send(&nak, 1);
+        return EOS_ERR_INVALID;
+    }
+
     uint8_t ack = UART_RAW_ACK;
     eos_hal_uart_send(&ack, 1);
 
@@ -523,10 +532,6 @@ static int ymodem_receive(eos_fw_transport_t *tp, eos_fw_update_ctx_t *ctx)
         eos_hal_uart_send(&c, 1);
         expected_blk++;
         eos_hal_watchdog_feed();
-
-        if (file_size > 0 && total_received >= file_size) {
-            /* File complete — wait for EOT */
-        }
     }
 
     return EOS_OK;

@@ -769,7 +769,7 @@ TEST(test_xmodem_eot_before_container_is_complete_is_rejected)
  * Raw length-prefixed transport
  * ================================================================ */
 
-static int run_raw(void)
+static int run_raw_ctx(eos_fw_update_ctx_t *ctx)
 {
     const eos_fw_transport_ops_t *ops = eos_fw_transport_uart_raw();
     eos_fw_transport_t tp;
@@ -778,9 +778,14 @@ static int run_raw(void)
     tp.baudrate = 115200;
     tp.timeout_ms = 10;
 
+    ASSERT(eos_fw_update_begin(ctx, EOS_SLOT_B) == EOS_OK);
+    return ops->receive(&tp, ctx);
+}
+
+static int run_raw(void)
+{
     eos_fw_update_ctx_t ctx;
-    ASSERT(eos_fw_update_begin(&ctx, EOS_SLOT_B) == EOS_OK);
-    return ops->receive(&tp, &ctx);
+    return run_raw_ctx(&ctx);
 }
 
 static void push_le32(uint32_t v)
@@ -800,6 +805,28 @@ TEST(test_raw_valid_transfer_is_written)
     ASSERT(run_raw() == EOS_OK);
     ASSERT(flash_matches_image());
     ASSERT(tx_contains(XM_ACK));
+}
+
+/*
+ * The length prefix is the sender's framing, not the image's. A transfer
+ * that delivers every declared byte but stops inside the container leaves
+ * the TLV area outstanding, and must be NAK'd rather than acknowledged as a
+ * received image.
+ */
+TEST(test_raw_transfer_shorter_than_container_is_rejected)
+{
+    eos_fw_update_ctx_t ctx;
+    size_t short_len = CONT_LEN - CONT_TLV_LEN;   /* header + payload, no TLV */
+
+    build_container();
+    push_le32((uint32_t)short_len);
+    rx_push(container, short_len);
+
+    ASSERT(run_raw_ctx(&ctx) == EOS_ERR_INVALID);
+    ASSERT(tx_contains(XM_NAK));
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) != 0);
+    ASSERT(eos_fw_update_get_state(&ctx) != EOS_FW_STATE_VERIFY);
+    ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_ERR_INVALID);
 }
 
 /*
@@ -848,10 +875,11 @@ int main(void)
     run_test_xmodem_data_block_after_container_is_rejected();
     run_test_xmodem_eot_before_container_is_complete_is_rejected();
     run_test_raw_valid_transfer_is_written();
+    run_test_raw_transfer_shorter_than_container_is_rejected();
     run_test_raw_oversized_length_is_rejected();
     run_test_raw_zero_length_is_rejected();
 
-    tests_run = 18;
+    tests_run = 19;
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
 }
