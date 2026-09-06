@@ -194,7 +194,18 @@ TEST(test_write_does_not_reach_verify_until_tlv_arrives)
     ASSERT(eos_fw_update_begin(&ctx, EOS_SLOT_B) == EOS_OK);
     ASSERT(eos_fw_update_write(&ctx, image, STREAMED_LEN) == EOS_OK);
     ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_TLV);
+
+    /* The TLV area is part of the container, so an outstanding TLV area
+     * cannot report a finished transfer. */
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) != 0);
+    ASSERT(eos_fw_update_progress(&ctx) < 100);
+
     ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_ERR_INVALID);
+
+    ASSERT(eos_fw_update_write(&ctx, image + STREAMED_LEN, TLV_AREA_LEN) == EOS_OK);
+    ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_VERIFY);
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) == 0);
+    ASSERT(eos_fw_update_progress(&ctx) == 100);
 }
 
 TEST(test_write_rejects_bytes_past_the_image_container)

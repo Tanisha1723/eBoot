@@ -295,8 +295,12 @@ uint8_t eos_fw_update_progress(const eos_fw_update_ctx_t *ctx)
     if (ctx->state == EOS_FW_STATE_COMPLETE) return 100;
 
     /* Bug Fix: Prevent potential integer overflow when computing total size */
+    /* The container is header + payload + TLV area and total_received
+     * counts all three, so the denominator has to as well: leaving the
+     * TLV area out reported 100% while it was still outstanding. */
     uint32_t total;
-    if (__builtin_add_overflow((uint32_t)sizeof(eos_image_header_t), ctx->payload_total, &total)) {
+    if (__builtin_add_overflow((uint32_t)sizeof(eos_image_header_t), ctx->payload_total, &total) ||
+        __builtin_add_overflow(total, ctx->tlv_total, &total)) {
         total = 0xFFFFFFFF;
     }
     

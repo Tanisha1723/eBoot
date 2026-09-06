@@ -238,6 +238,11 @@ static int xmodem_receive(eos_fw_transport_t *tp, eos_fw_update_ctx_t *ctx)
         if (soh == XMODEM_EOT) {
             c = XMODEM_ACK;
             eos_hal_uart_send(&c, 1);
+
+            /* The handshake is complete, but the container decides whether
+             * what arrived is a whole image. A sender that stops early must
+             * not have its truncated transfer reported as a success. */
+            if (eos_fw_update_bytes_wanted(ctx) != 0) return EOS_ERR_INVALID;
             break;
         }
 
@@ -357,11 +362,17 @@ static int ymodem_receive(eos_fw_transport_t *tp, eos_fw_update_ctx_t *ctx)
             c = XMODEM_ACK;
             eos_hal_uart_send(&c, 1);
 
-            if (first_block) break;
+            if (!first_block) {
+                /* YMODEM sends a second EOT */
+                c = XMODEM_CRC;
+                eos_hal_uart_send(&c, 1);
+            }
 
-            /* YMODEM sends a second EOT */
-            c = XMODEM_CRC;
-            eos_hal_uart_send(&c, 1);
+            /* The handshake is complete, but the container decides whether
+             * what arrived is a whole image. A sender that stops early must
+             * not have its truncated transfer reported as a success, and an
+             * EOT before block 0 has delivered no image at all. */
+            if (eos_fw_update_bytes_wanted(ctx) != 0) return EOS_ERR_INVALID;
             break;
         }
 
@@ -465,6 +476,17 @@ static int ymodem_receive(eos_fw_transport_t *tp, eos_fw_update_ctx_t *ctx)
             c = XMODEM_NAK;
             eos_hal_uart_send(&c, 1);
             continue;
+        }
+
+        /* The container was already complete before this block arrived, so
+         * these bytes are not padding on the final block -- they are an
+         * entire extra block, and ACKing them would accept an unbounded
+         * amount of data no length field accounts for. Padding inside the
+         * final block is still consumed, just below. */
+        if (eos_fw_update_bytes_wanted(ctx) == 0) {
+            c = XMODEM_CAN;
+            eos_hal_uart_send(&c, 1);
+            return EOS_ERR_INVALID;
         }
 
         /* Bytes of the declared file carried by this block. file_size stays

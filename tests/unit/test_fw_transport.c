@@ -606,6 +606,67 @@ TEST(test_ymodem_declared_size_larger_than_container_is_clamped)
     ASSERT(!tx_contains(XM_CAN));
 }
 
+/*
+ * Clamping the surplus inside the final block is framing. An entire further
+ * data block once the container is complete is not, and ACKing it would let
+ * a sender push an unbounded amount of data that no length field accounts
+ * for. The declared size leaves room for the extra block, so this exercises
+ * the container check rather than the file-size bound.
+ */
+TEST(test_ymodem_data_block_after_container_is_rejected)
+{
+    eos_fw_update_ctx_t ctx;
+    uint8_t extra[BLOCK];
+
+    build_container();
+    push_header_block("fw.bin", "640");   /* 424 bytes of image, 5 blocks declared */
+    push_container_blocks();
+
+    memset(extra, 0x5C, sizeof(extra));
+    push_block((uint8_t)(CONT_BLOCKS + 1), extra, sizeof(extra));
+    rx_push_byte(XM_EOT);
+    rx_push_byte(XM_EOT);
+
+    ASSERT(run_ymodem_ctx(&ctx) == EOS_ERR_INVALID);
+    ASSERT(tx_contains(XM_CAN));
+
+    /* The container that did arrive is intact, and the extra block reached
+     * neither flash nor the update context. */
+    ASSERT(memcmp(&sim_flash[SIM_SLOT_B_ADDR], container, CONT_LEN) == 0);
+    ASSERT(sim_flash[SIM_SLOT_B_ADDR + CONT_LEN] == 0xFF);
+    ASSERT(ctx.tlv_written == CONT_TLV_LEN);
+
+    /* eos_fw_transport_update() aborts the context when receive fails, so a
+     * rejected transfer cannot then be finalized as a good image. */
+    eos_fw_update_abort(&ctx);
+    ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_IDLE);
+    ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_ERR_INVALID);
+}
+
+/*
+ * EOT ends the transfer, but it does not make a short transfer complete. The
+ * handshake still runs -- no CAN -- and the truncated result is reported as
+ * an error rather than as a received image.
+ */
+TEST(test_ymodem_eot_before_container_is_complete_is_rejected)
+{
+    eos_fw_update_ctx_t ctx;
+    int i;
+
+    build_container();
+    push_header_block("fw.bin", "512");
+    for (i = 0; i < CONT_BLOCKS - 1; i++)
+        push_block((uint8_t)(i + 1), &container[(size_t)i * BLOCK], BLOCK);
+    rx_push_byte(XM_EOT);
+    rx_push_byte(XM_EOT);
+
+    ASSERT(run_ymodem_ctx(&ctx) == EOS_ERR_INVALID);
+    ASSERT(!tx_contains(XM_CAN));
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) != 0);
+    ASSERT(eos_fw_update_get_state(&ctx) != EOS_FW_STATE_VERIFY);
+    ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_ERR_INVALID);
+}
+
 /* ================================================================
  * XMODEM
  * ================================================================ */
@@ -679,6 +740,28 @@ TEST(test_xmodem_data_block_after_container_is_rejected)
      * rejected transfer cannot then be finalized as a good image. */
     eos_fw_update_abort(&ctx);
     ASSERT(eos_fw_update_get_state(&ctx) == EOS_FW_STATE_IDLE);
+    ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_ERR_INVALID);
+}
+
+/*
+ * The XMODEM counterpart: the EOT handshake completes, but three of the four
+ * blocks leave the payload and TLV area short, so the transfer is an error
+ * rather than a received image.
+ */
+TEST(test_xmodem_eot_before_container_is_complete_is_rejected)
+{
+    eos_fw_update_ctx_t ctx;
+    int i;
+
+    build_container();
+    for (i = 0; i < CONT_BLOCKS - 1; i++)
+        push_block((uint8_t)(i + 1), &container[(size_t)i * BLOCK], BLOCK);
+    rx_push_byte(XM_EOT);
+
+    ASSERT(run_xmodem(&ctx) == EOS_ERR_INVALID);
+    ASSERT(!tx_contains(XM_CAN));
+    ASSERT(eos_fw_update_bytes_wanted(&ctx) != 0);
+    ASSERT(eos_fw_update_get_state(&ctx) != EOS_FW_STATE_VERIFY);
     ASSERT(eos_fw_update_finalize(&ctx, EOS_UPGRADE_TEST) == EOS_ERR_INVALID);
 }
 
@@ -759,13 +842,16 @@ int main(void)
     run_test_ymodem_header_size_overflow_is_rejected();
     run_test_ymodem_first_block_must_be_zero();
     run_test_ymodem_declared_size_larger_than_container_is_clamped();
+    run_test_ymodem_data_block_after_container_is_rejected();
+    run_test_ymodem_eot_before_container_is_complete_is_rejected();
     run_test_xmodem_padded_final_block_completes_and_finalizes();
     run_test_xmodem_data_block_after_container_is_rejected();
+    run_test_xmodem_eot_before_container_is_complete_is_rejected();
     run_test_raw_valid_transfer_is_written();
     run_test_raw_oversized_length_is_rejected();
     run_test_raw_zero_length_is_rejected();
 
-    tests_run = 15;
+    tests_run = 18;
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
 }
