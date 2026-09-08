@@ -99,6 +99,7 @@ static int tests_passed = 0;
         sim_counter = 0; \
         eos_hal_init(&sim_ops); \
         printf("  %-58s ", #name); \
+        tests_run++; \
         name(); \
         tests_passed++; \
         printf("[PASS]\n"); \

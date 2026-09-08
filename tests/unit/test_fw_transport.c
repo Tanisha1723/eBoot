@@ -164,6 +164,7 @@ static int tests_passed = 0;
     static void run_##name(void) { \
         setup(); \
         printf("  %-56s ", #name); \
+        tests_run++; \
         name(); \
         tests_passed++; \
         printf("[OK]\n"); \
